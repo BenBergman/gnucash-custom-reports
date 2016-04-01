@@ -61,6 +61,12 @@
 (define optname-plot-width (N_ "Plot Width"))
 (define optname-plot-height (N_ "Plot Height"))
 
+(define savingsrate
+  (lambda (expenses income)
+    (if (= income 0)
+      0
+      (/ (+ expenses income) income))))
+
 (define (options-generator inc-exp?)
   (let* ((options (gnc:new-options))
          ;; This is just a helper function for making options.
@@ -310,7 +316,7 @@
 
        (gnc:report-percent-done 80)
        (set! net-list
-             (map / (map + assets-list liability-list) assets-list))
+             (map savingsrate liability-list assets-list))
        (gnc:report-percent-done 90)
 
        (gnc:html-barchart-set-title!
