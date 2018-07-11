@@ -24,23 +24,19 @@
 ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define-module (gnucash report standard-reports savings-rate))
+(define-module (gnucash report savings-rate))
 
 (use-modules (srfi srfi-1))
-(use-modules (gnucash main)) ;; FIXME: delete after we finish modularizing.
+(use-modules (gnucash utilities)) 
 (use-modules (gnucash gnc-module))
 (use-modules (gnucash gettext))
 
-(use-modules (gnucash printf))
 (use-modules (gnucash report report-system report-collectors))
 (use-modules (gnucash report report-system collectors))
 (use-modules (gnucash report standard-reports category-barchart)) ; for guids of called reports
 
 (gnc:module-load "gnucash/report/report-system" 0)
 
-;; included since Bug726449
-(use-modules (ice-9 regex)) ;; for regexp-substitute/global, used by jpqplot
-(load-from-path "html-jqplot") ;; for jqplot-escape-string
 
 (define reportname (N_ "Savings Rate"))
 
@@ -67,10 +63,13 @@
       0
       (/ (+ expenses income) income))))
 
-(define (options-generator inc-exp?)
+;;(define optname-x-grid (N_ "X grid"))
+(define optname-y-grid (N_ "Grid"))
+
+(define (options-generator inc-exp? linechart?)
   (let* ((options (gnc:new-options))
          ;; This is just a helper function for making options.
-         ;; See gnucash/src/scm/options.scm for details.
+         ;; See libgnucash/scm/options.scm for details.
          (add-option
           (lambda (new-option)
             (gnc:register-option options new-option))))
@@ -142,7 +141,36 @@
 
     (gnc:options-add-plot-size!
      options gnc:pagename-display
-     optname-plot-width optname-plot-height "d" 1200 800)
+     optname-plot-width optname-plot-height "d" (cons 'percent 100.0) (cons 'percent 100.0))
+
+    (if linechart?
+        (begin
+
+          (add-option
+           (gnc:make-number-range-option
+            gnc:pagename-display optname-line-width
+            "e" opthelp-line-width
+            1.5 0.5 5 1 0.1 ))
+
+          (add-option
+           (gnc:make-simple-boolean-option
+            gnc:pagename-display optname-y-grid
+            "f" (N_ "Add grid lines.")
+            #t))
+
+          ;;(add-option
+          ;; (gnc:make-simple-boolean-option
+          ;;  gnc:pagename-display optname-x-grid
+          ;;  "g" (N_ "Add vertical grid lines.")
+          ;;  #f))
+
+          (add-option
+           (gnc:make-simple-boolean-option
+            gnc:pagename-display optname-markers
+            "g" (N_ "Display a mark for each data point.")
+            #t))
+
+          ))
 
     (gnc:options-set-default-section options gnc:pagename-general)
 
@@ -154,7 +182,7 @@
 ;; includes all the relevant Scheme code. The option database passed
 ;; to the function is one created by the options-generator function
 ;; defined above.
-(define (net-renderer report-obj inc-exp?)
+(define (net-renderer report-obj inc-exp? linechart?)
 
   ;; This is a helper function for looking up option values.
   (define (get-option section name)
@@ -162,51 +190,61 @@
      (gnc:lookup-option (gnc:report-options report-obj) section name)))
 
   (gnc:report-starting reportname)
-  (let* ((to-date-tp (gnc:timepair-end-day-time
-                      (gnc:date-option-absolute-time
-                       (get-option gnc:pagename-general
-				   optname-to-date))))
-         (from-date-tp (gnc:timepair-start-day-time
-                        (gnc:date-option-absolute-time
-                         (get-option gnc:pagename-general
-				     optname-from-date))))
+  (let* ((to-date-t64 (gnc:time64-end-day-time
+                       (gnc:date-option-absolute-time
+                        (get-option gnc:pagename-general
+                                    optname-to-date))))
+         (from-date-t64 (gnc:time64-start-day-time
+                         (gnc:date-option-absolute-time
+                          (get-option gnc:pagename-general
+                                      optname-from-date))))
          (interval (get-option gnc:pagename-general optname-stepsize))
-         (report-currency (get-option gnc:pagename-general
-                                      optname-report-currency))
-         (price-source (get-option gnc:pagename-general
-                                   optname-price-source))
+         (report-currency (get-option gnc:pagename-general optname-report-currency))
+         (price-source (get-option gnc:pagename-general optname-price-source))
 
          (accounts (get-option gnc:pagename-accounts optname-accounts))
 
-         (show-sep? (get-option gnc:pagename-display
-				(if inc-exp? optname-inc-exp
-				    optname-sep-bars)))
-         (show-net? (get-option gnc:pagename-display
-				(if inc-exp? optname-show-profit
-				    optname-net-bars)))
+         (show-sep? (get-option gnc:pagename-display (if inc-exp?
+                                                         optname-inc-exp
+                                                         optname-sep-bars)))
+         (show-net? (get-option gnc:pagename-display (if inc-exp?
+                                                         optname-show-profit
+                                                         optname-net-bars)))
          (height (get-option gnc:pagename-display optname-plot-height))
          (width (get-option gnc:pagename-display optname-plot-width))
-
+         (markers (if linechart?
+                      (get-option gnc:pagename-display optname-markers)))
+         (line-width (if linechart?
+                         (get-option gnc:pagename-display optname-line-width)))
+         (y-grid (if linechart? (get-option gnc:pagename-display optname-y-grid)))
+         ;;(x-grid (if linechart? (get-option gnc:pagename-display optname-x-grid)))
          (commodity-list #f)
          (exchange-fn #f)
 
-         (dates-list ((if inc-exp? gnc:make-date-interval-list
+         (dates-list ((if inc-exp?
+                          gnc:make-date-interval-list
                           gnc:make-date-list)
-                      ((if inc-exp? gnc:timepair-start-day-time
-                           gnc:timepair-end-day-time) from-date-tp)
-                      (gnc:timepair-end-day-time to-date-tp)
+                      ((if inc-exp?
+                           gnc:time64-start-day-time
+                           gnc:time64-end-day-time)
+                       from-date-t64)
+                      (gnc:time64-end-day-time to-date-t64)
                       (gnc:deltasym-to-delta interval)))
-	 (report-title (get-option gnc:pagename-general
-                                  gnc:optname-reportname))
+         (report-title (get-option gnc:pagename-general gnc:optname-reportname))
          (classified-accounts (gnc:decompose-accountlist accounts))
          (show-table? (get-option gnc:pagename-display (N_ "Show table")))
          (document (gnc:make-html-document))
-         (chart (gnc:make-html-barchart))
+         (chart (if linechart?
+                    (gnc:make-html-linechart)
+                    (gnc:make-html-barchart)))
          (non-zeros #f))
 
     (define (add-column! data-list)
       (begin
-        (gnc:html-barchart-append-column! chart data-list)
+        ((if linechart?
+             gnc:html-linechart-append-column!
+             gnc:html-barchart-append-column!)
+         chart data-list)
         (if (gnc:not-all-zeros data-list) (set! non-zeros #t))
         #f))
 
@@ -214,7 +252,7 @@
     ;; 'report-currency' according to the exchange-fn. Returns a
     ;; double.
     (define (collector->double c date)
-      (if (not (gnc:timepair? date))
+      (if (not (number? date))
 	  (throw 'wrong))
       (gnc-numeric-to-double
        (gnc:gnc-monetary-amount
@@ -257,8 +295,8 @@
     (gnc:report-percent-done 10)
     (set! exchange-fn (gnc:case-exchange-time-fn
                        price-source report-currency
-                       commodity-list to-date-tp
-		       10 40))
+                       commodity-list to-date-t64
+                       10 40))
     (gnc:report-percent-done 50)
 
     (if
@@ -270,9 +308,9 @@
             (date-string-list (map
                                (if inc-exp?
                                    (lambda (date-list-item)
-                                     (gnc-print-date
+                                     (qof-print-date
                                       (car date-list-item)))
-                                   gnc-print-date)
+                                   qof-print-date)
                                dates-list)))
        (let* ((the-acount-destination-alist
 	       (if inc-exp?
@@ -319,122 +357,157 @@
              (map savingsrate liability-list assets-list))
        (gnc:report-percent-done 90)
 
-       (gnc:html-barchart-set-title!
+       ((if linechart?
+            gnc:html-linechart-set-title!
+            gnc:html-barchart-set-title!)
         chart report-title)
-       (gnc:html-barchart-set-subtitle!
-        chart (sprintf #f
-                       (_ "%s to %s")
-                       (jqplot-escape-string (gnc-print-date from-date-tp))
-                       (jqplot-escape-string (gnc-print-date to-date-tp))))
-       (gnc:html-barchart-set-width! chart width)
-       (gnc:html-barchart-set-height! chart height)
-       (gnc:html-barchart-set-row-labels! chart date-string-list)
-       (gnc:html-barchart-set-y-axis-label!
+
+       ((if linechart?
+            gnc:html-linechart-set-subtitle!
+            gnc:html-barchart-set-subtitle!)
+        chart (format #f
+                       (_ "~a to ~a")
+                       (qof-print-date from-date-t64)
+                       (qof-print-date to-date-t64)))
+
+       ((if linechart?
+            gnc:html-linechart-set-width!
+            gnc:html-barchart-set-width!) chart width)
+
+       ((if linechart?
+            gnc:html-linechart-set-height!
+            gnc:html-barchart-set-height!) chart height)
+
+       (if linechart?
+           (begin
+             (gnc:html-linechart-set-row-labels! chart date-iso-string-list)
+             (gnc:html-linechart-set-major-grid?! chart y-grid))
+           (gnc:html-barchart-set-row-labels! chart date-string-list))
+
+       ((if linechart?
+            gnc:html-linechart-set-y-axis-label!
+            gnc:html-barchart-set-y-axis-label!)
         chart (gnc-commodity-get-mnemonic report-currency))
-       ;; Determine whether we have enough space for horizontal labels
-       ;; -- kind of a hack. Assumptions: y-axis labels and legend
-       ;; require 200 pixels, and each x-axes label needs 60 pixels.
-       (gnc:html-barchart-set-row-labels-rotated?!
-        chart (< (/ (- width 200)
-                    (length date-string-list)) 60))
+       ;;;; Determine whether we have enough space for horizontal labels
+       ;;;; -- kind of a hack. Assumptions: y-axis labels and legend
+       ;;;; require 200 pixels, and each x-axes label needs 60 pixels.
+       ;;(gnc:html-barchart-set-row-labels-rotated?!
+       ;; chart (< (/ (- width 200)
+       ;;             (length date-string-list)) 60))
 
        ;; Add the data
        (if show-net?
            (add-column! net-list))
 
        ;; Legend labels, colors
-       (gnc:html-barchart-set-col-labels!
+       ((if linechart?
+            gnc:html-linechart-set-col-labels!
+            gnc:html-barchart-set-col-labels!)
         chart (append
                (if show-net?
                    (if inc-exp?
                        (list (_ "Savings Rate"))
                        (list (_ "Net Worth")))
                    '())))
-       (gnc:html-barchart-set-col-colors!
+
+       ((if linechart?
+            gnc:html-linechart-set-col-colors!
+            gnc:html-barchart-set-col-colors!)
         chart (append
                (if show-net?
-                   '("green") '())))
+                   '("#2ECC40") '())))
+
+       ;; Set the line width and markers
+       (if linechart?
+           (begin
+             (gnc:html-linechart-set-line-width! chart line-width)
+             (gnc:html-linechart-set-markers?! chart markers)))
 
        ;; URLs for income/expense or asset/liabilities bars.
-       (if show-sep?
-           (let ((urls
-                  (list
-                   (gnc:make-report-anchor
-                    (if inc-exp?
-                        category-barchart-income-uuid
-                        category-barchart-asset-uuid)
-                    report-obj
-                    (list
-                     (list gnc:pagename-display
-                           "Use Stacked Bars" #t)
-                     (list gnc:pagename-general
-                           gnc:optname-reportname
-                           (if inc-exp?
-                               (_ "Income Chart")
-                               (_ "Asset Chart")))))
-                   (gnc:make-report-anchor
-                    (if inc-exp?
-                        category-barchart-expense-uuid
-                        category-barchart-liability-uuid)
-                    report-obj
-                    (list
-                     (list gnc:pagename-display
-                           "Use Stacked Bars" #t)
-                     (list gnc:pagename-general
-                           gnc:optname-reportname
-                           (if inc-exp?
-                               (_ "Expense Chart")
-                               (_ "Liability Chart"))))))))
-             (gnc:html-barchart-set-button-1-bar-urls!
-              chart urls)
-             (gnc:html-barchart-set-button-1-legend-urls!
-              chart urls)))
+       ;;(if show-sep?
+       ;;    (let ((urls
+       ;;           (list
+       ;;            (gnc:make-report-anchor
+       ;;             (if inc-exp?
+       ;;                 category-barchart-income-uuid
+       ;;                 category-barchart-asset-uuid)
+       ;;             report-obj
+       ;;             (list
+       ;;              (list gnc:pagename-display
+       ;;                    "Use Stacked Bars" #t)
+       ;;              (list gnc:pagename-general
+       ;;                    gnc:optname-reportname
+       ;;                    (if inc-exp?
+       ;;                        (_ "Income Chart")
+       ;;                        (_ "Asset Chart")))))
+       ;;            (gnc:make-report-anchor
+       ;;             (if inc-exp?
+       ;;                 category-barchart-expense-uuid
+       ;;                 category-barchart-liability-uuid)
+       ;;             report-obj
+       ;;             (list
+       ;;              (list gnc:pagename-display
+       ;;                    "Use Stacked Bars" #t)
+       ;;              (list gnc:pagename-general
+       ;;                    gnc:optname-reportname
+       ;;                    (if inc-exp?
+       ;;                        (_ "Expense Chart")
+       ;;                        (_ "Liability Chart"))))))))
+       ;;      (gnc:html-barchart-set-button-1-bar-urls!
+       ;;       chart urls)
+       ;;      (gnc:html-barchart-set-button-1-legend-urls!
+       ;;       chart urls)))
 
        ;; Test for all-zero data here.
        (if non-zeros
            (begin
-           (gnc:html-document-add-object! document chart)
+             (gnc:html-document-add-object! document chart)
              (if show-table?
-             (let ((table (gnc:make-html-table)))
-                (gnc:html-table-set-col-headers!
-                 table
-                 (append
-                  (list (_ "Date"))
-                  (if show-sep?
-                      (if inc-exp?
-                          (list (_ "Income") (_ "Expense"))
-                          (list (_ "Assets") (_ "Liabilities")))
-                      '())
-                  (if show-net?
-                      (if inc-exp?
-                          (list (_ "Savings Rate"))
-                          (list (_ "Net Worth")))
-                      '()))
-                 )
-               (gnc:html-table-append-column! table date-string-list)
-               (if show-sep?
-                   (begin
-                     (gnc:html-table-append-column! table assets-list)
-                     (gnc:html-table-append-column! table liability-list)
+                 (let ((table (gnc:make-html-table)))
+                   (gnc:html-table-set-style!
+                    table "table"
+                    'attribute (list "border" 0)
+                    'attribute (list "cellspacing" 0)
+                    'attribute (list "cellpadding" 4))
+                   (gnc:html-table-set-col-headers!
+                    table
+                    (append
+                     (list (_ "Date"))
+                     (if show-sep?
+                         (if inc-exp?
+                             (list (_ "Income") (_ "Expense"))
+                             (list (_ "Assets") (_ "Liabilities")))
+                         '())
+                     (if show-net?
+                         (if inc-exp?
+                             (list (_ "Savings Rate"))
+                             (list (_ "Net Worth")))
+                         '()))
                     )
-                   )
-               (if show-net?
-                   (gnc:html-table-append-column! table net-list)
-                   )
-               ;; set numeric columns to align right
-                (for-each
-                 (lambda (col)
-                   (gnc:html-table-set-col-style!
-                    table col "td"
-                    'attribute (list "class" "number-cell")))
-                 '(1 2 3))
+                   (gnc:html-table-append-column! table date-string-list)
+                   (if show-sep?
+                       (begin
+                         (gnc:html-table-append-column! table assets-list)
+                         (gnc:html-table-append-column! table liability-list)
+                         )
+                       )
+                   (if show-net?
+                       (gnc:html-table-append-column! table net-list)
+                       )
+                   ;; set numeric columns to align right
+                   (for-each
+                    (lambda (col)
+                      (gnc:html-table-set-col-style!
+                       table col "td"
+                       'attribute (list "class" "number-cell")))
+                    '(1 2 3))
 
-              (gnc:html-document-add-object! document table))
-             ))
+                   (gnc:html-document-add-object! document table))
+                 ))
            (gnc:html-document-add-object!
             document
             (gnc:html-make-empty-data-warning
-	     report-title (gnc:report-id report-obj)))))
+             report-title (gnc:report-id report-obj)))))
 
      ;; else no accounts selected
      (gnc:html-document-add-object!
@@ -447,16 +520,16 @@
 
 ;; Export reports
 
-(export income-expense-barchart-uuid)
+(export savings-rate-barchart-uuid)
 
-(define income-expense-barchart-uuid "7c468c280aff4472857994af639122a5")
+(define savings-rate-barchart-uuid "bcbd5be60edf40818148911f155c62d8")
 
 ;; Here we define the actual report
 (gnc:define-report
  'version 1
  'name reportname
- 'report-guid income-expense-barchart-uuid
- 'menu-name (N_ "Savings Rate")
- 'menu-path (list gnc:menuname-income-expense)
- 'options-generator (lambda () (options-generator #t))
- 'renderer (lambda (report-obj) (net-renderer report-obj #t)))
+ 'report-guid savings-rate-barchart-uuid
+ ;;'menu-name (N_ "Savings Rate")
+ 'menu-path (list gnc:menuname-utility)
+ 'options-generator (lambda () (options-generator #t #f))
+ 'renderer (lambda (report-obj) (net-renderer report-obj #t #f)))
